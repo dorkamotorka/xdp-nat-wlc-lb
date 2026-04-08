@@ -73,12 +73,12 @@ func main() {
 		type lbBackend struct {
 			Ip          uint32
 			Connections uint32
-			Weight      uint16
+			Weight      uint32
 		}
 		backEp := lbBackend{
 			Ip:          backIP,
 			Connections: 0,
-			Weight:      uint16(i + 1), // Dummy but different weight for each backend - add 1 to avoid zero weight
+			Weight:      uint32(i + 1), // Dummy but different weight for each backend - add 1 to avoid zero weight
 		}
 		if err := objs.lbMaps.Backends.Put(uint32(i), &backEp); err != nil {
 			log.Fatalf("Error adding backend #%d (%s) to eBPF map: %v", i, backend, err)

@@ -28,7 +28,7 @@ struct backend {
   // Number of active connections to this backend, used for least-connections load balancing algorithm
   __u32 num_connections;
   // Backend weight for weighted load balancing algorithms
-  __u16 weight;
+  __u32 weight;
 };
 
 enum tcp_state {
