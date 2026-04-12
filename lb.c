@@ -359,7 +359,7 @@ int xdp_load_balancer(struct xdp_md *ctx) {
           // Calculate score: (connections * scale) / weight
           // Higher weight reduces the score, making the backend more likely to be picked.
           // We add 1 to num_connections so that weight matters even at 0 connections.
-          __u32 score = ((candidate_backend->num_connections + 1) * 1024) / candidate_backend->weight;
+          __u32 score = ((b->num_connections + 1) * 1024) / b->weight;
 
           if (score < min_score) {
             min_score = score;
