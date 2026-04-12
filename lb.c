@@ -8,7 +8,7 @@
 #define ETH_ALEN 6              // Octets in one ethernet addr
 #define AF_INET 2               // Instead of including the whole sys/socket.h header
 #define IPROTO_TCP 6            // TCP
-#define MAX_TCP_CHECK_WORDS 750 // max 1500 bytes to check in TCP checksum. This is MTU dependent
+#define MAX_TCP_CHECK_WORDS 750 // Max bytes to check in TCP checksum
 
 struct five_tuple_t {
   __u32 src_ip;
@@ -18,37 +18,37 @@ struct five_tuple_t {
   __u8  protocol;
 };
 
+// Backend endpoint information - only IP to simplify, but could be extended with port or other metadata
 struct endpoint {
   __u32 ip;
 };
 
 struct backend {
-  // Backend endpoint information (currently only IP, but could be extended with port or other metadata)
+  // Backend endpoint information
   struct endpoint endpoint;
   // Number of active connections to this backend, used for least-connections load balancing algorithm
-  __u32 num_connections;
+  __u32  num_connections;
   // Backend weight for weighted load balancing algorithms
   __u32 weight;
 };
 
 enum tcp_state {
-  TCP_STATE_SYN_SEEN = 0,        // SYN seen, handshake not complete
-  TCP_STATE_ESTABLISHED = 1,     // ACK seen → handshake complete
-  TCP_STATE_FIN_FROM_CLIENT = 2, // FIN seen from client
-  TCP_STATE_FIN_FROM_BACKEND = 3,// FIN seen from backend
-  TCP_STATE_FIN_BOTH = 4,        // FIN seen from both sides, waiting for final ACK
+  TCP_STATE_UNKNOWN = 0,          // Initial placeholder
+  TCP_STATE_SYN_SEEN = 1,         // SYN seen from client, handshake not complete
+  TCP_STATE_ESTABLISHED = 2,      // ACK seen from client, handshake complete
+  TCP_STATE_FIN_FROM_CLIENT = 3,  // FIN seen from client
+  TCP_STATE_FIN_FROM_BACKEND = 4, // FIN seen from backend
+  TCP_STATE_FIN_BOTH = 5,         // FIN seen from both sides, waiting for final ACK
 };
 
 struct connection {
   // Index of the backend in the backends map for this connection
   __u32 backend_index;
-  // State based on the tcp_state enum
+  // State of the connection
   __u8  state;
 };
 
-// Backend IPs
-// We could also include port information but we simplify
-// and assume that both LB and Backend listen on the same port for requests
+// Map of backends
 struct {
   __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, NUM_BACKENDS);
@@ -56,6 +56,7 @@ struct {
   __type(value, struct backend);
 } backends SEC(".maps");
 
+// Map of NAT translations 
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 1000);
@@ -63,6 +64,7 @@ struct {
   __type(value, struct endpoint);
 } conntrack SEC(".maps");
 
+// Map for connection tracking
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 1000);
@@ -124,8 +126,8 @@ static __always_inline __u16 recalc_ip_checksum(struct iphdr *ip) {
   // Compute incremental checksum difference over the header
   __u64 csum = bpf_csum_diff(0, 0, (unsigned int *)ip, sizeof(struct iphdr), 0);
 
-// fold 64-bit csum to 16 bits (the “carry add” loop)
-#pragma unroll
+  // fold 64-bit csum to 16 bits (the “carry add” loop)
+  #pragma unroll
   for (int i = 0; i < 4; i++) {
     if (csum >> 16)
       csum = (csum & 0xffff) + (csum >> 16);
@@ -144,7 +146,6 @@ static __always_inline __u16 recalc_tcp_checksum(struct tcphdr *tcph, struct iph
   sum += bpf_htons(IPPROTO_TCP);
 
   // Pseudo-header: TCP Length (Total IP len - IP header len)
-  // IMPORTANT: Use the IP header, not data_end
   __u16 tcp_len = bpf_ntohs(iph->tot_len) - (iph->ihl * 4);
   sum += bpf_htons(tcp_len);
 
@@ -152,7 +153,7 @@ static __always_inline __u16 recalc_tcp_checksum(struct tcphdr *tcph, struct iph
   // Use a safe bound check against data_end for the pointer,
   // but the loop limit should be based on the actual packet size
   __u16 *ptr = (__u16 *)tcph;
-#pragma unroll
+  #pragma unroll
   for (int i = 0; i < MAX_TCP_CHECK_WORDS; i++) {
     if ((void *)(ptr + 1) > data_end || (void *)ptr >= (void *)tcph + tcp_len)
       break;
@@ -182,8 +183,7 @@ static __always_inline int fib_lookup_v4_full(struct xdp_md *ctx,
   __builtin_memset(fib, 0, sizeof(*fib));
   // Hardcode address family: AF_INET for IPv4
   fib->family = AF_INET;
-  // Source IPv4 address used by the kernel for policy routing and source
-  // address–based decisions
+  // Source IPv4 address used by the kernel for policy routing and source address–based decisions
   fib->ipv4_src = src;
   // Destination IPv4 address (in network byte order)
   // The address we want to reach; used to find the correct egress route
@@ -199,53 +199,48 @@ static __always_inline int fib_lookup_v4_full(struct xdp_md *ctx,
 }
 
 // Update connection state in map and reload pointer
-static __always_inline struct connection* update_conn_state(struct five_tuple_t *five_tuple,
+static __always_inline struct connection *update_state(struct five_tuple_t *five_tuple,
                                                             struct connection *conn,
                                                             __u8 new_state) {
-  struct connection updated = *conn;
-  updated.state = new_state;
-
-  bpf_map_update_elem(&statetrack, five_tuple, &updated, BPF_ANY);
+  conn->state = new_state;
+  bpf_map_update_elem(&statetrack, five_tuple, conn, BPF_ANY);
   return bpf_map_lookup_elem(&statetrack, five_tuple);
-}
-
-// Decrement backend connection count + delete connection
-static __always_inline void cleanup_connection(struct five_tuple_t *five_tuple,
-                                               struct connection *conn) {
-  struct backend *b = bpf_map_lookup_elem(&backends, &conn->backend_index);
-  if (!b)
-    return;
-
-  struct backend nb = *b;
-  if (nb.num_connections > 0)
-    nb.num_connections--;
-
-  bpf_map_update_elem(&backends, &conn->backend_index, &nb, BPF_ANY);
-  bpf_map_delete_elem(&statetrack, five_tuple);
-  bpf_printk("Connection closed, cleaned up state and decremented backend with IP %pI4 connection count to %d", &nb.endpoint.ip, nb.num_connections);
 }
 
 static __always_inline void update_tcp_conn_state(struct five_tuple_t five_tuple, 
                                                   struct connection *conn, 
-                                                  struct tcphdr *tcp, 
-                                                  int direction) {
-  //bpf_printk("Updating connection state for direction %s, current state %d, TCP flags: SYN=%d, ACK=%d, FIN=%d, RST=%d",
-  //           (direction == 0) ? "client->backend" : "backend->client", conn->state, tcp->syn, tcp->ack, tcp->fin, tcp->rst);
-  
-  // client to backend direction
-  if (direction == 0 &&
-      conn->state == TCP_STATE_SYN_SEEN &&
-      tcp->syn == 0) {
-    conn = update_conn_state(&five_tuple, conn, TCP_STATE_ESTABLISHED);
-    if (!conn) {
-      return;
+                                                  struct tcphdr *tcp,
+                                                  int direction /* 0 = client->backend, 1 = backend->client */) {
+  switch (conn->state) {
+  // Should be SYN from client to backend
+  case TCP_STATE_UNKNOWN:
+    if (direction == 0 && tcp->syn) {
+      conn = update_state(&five_tuple, conn, TCP_STATE_SYN_SEEN);
     }
-    //bpf_printk("TCP Handshake complete, connection established..");
-  }
+    return;
 
-  if (tcp->fin) {
+  // Should be ACK from client to backend completing the handshake
+  case TCP_STATE_SYN_SEEN:
+    if (direction == 0 && !tcp->syn && tcp->ack) {
+      conn = update_state(&five_tuple, conn, TCP_STATE_ESTABLISHED);
+      if (!conn) return;
+
+      // Increment the connection count for the selected backend
+      struct backend *b = bpf_map_lookup_elem(&backends, &conn->backend_index);
+      if (b) {
+        b->num_connections++;
+        bpf_map_update_elem(&backends, &conn->backend_index, b, BPF_ANY);
+        bpf_printk("Selected backend with IP %pI4 with current number of connections equal to %d", &b->endpoint.ip, b->num_connections);
+      }
+    }
+    return;
+
+  // From established connection we need to see FINs from both sides
+  case TCP_STATE_ESTABLISHED:
+  case TCP_STATE_FIN_FROM_CLIENT:
+  case TCP_STATE_FIN_FROM_BACKEND:
+    if (!tcp->fin) return;
     __u8 new_state;
-
     if (direction == 0) {
       new_state = (conn->state == TCP_STATE_FIN_FROM_BACKEND)
                     ? TCP_STATE_FIN_BOTH
@@ -256,14 +251,25 @@ static __always_inline void update_tcp_conn_state(struct five_tuple_t five_tuple
                     : TCP_STATE_FIN_FROM_BACKEND;
     }
 
-    conn = update_conn_state(&five_tuple, conn, new_state);
-    if (!conn) {
-      return;
-    }
-  }
+    conn = update_state(&five_tuple, conn, new_state);
+    return;
 
-  if ((tcp->ack && conn->state == TCP_STATE_FIN_BOTH && tcp->fin == 0) || tcp->rst) {
-    cleanup_connection(&five_tuple, conn);
+  // After FIN from both sides, we wait for the final ACK or RST to clean up the connection
+  case TCP_STATE_FIN_BOTH:
+    if ((tcp->ack && !tcp->fin) || tcp->rst) {
+      // Decrement the connection count for the selected backend
+      struct backend *b = bpf_map_lookup_elem(&backends, &conn->backend_index);
+      if (b) {
+        if (b->num_connections > 0) b->num_connections--;
+        bpf_map_update_elem(&backends, &conn->backend_index, b, BPF_ANY);
+        bpf_printk("Connection closed, backend %pI4 now has %d connections", &b->endpoint.ip, b->num_connections);
+      }
+      bpf_map_delete_elem(&statetrack, &five_tuple);
+    }
+    return;
+
+  default:
+    return;
   }
 }
 
@@ -307,22 +313,12 @@ int xdp_load_balancer(struct xdp_md *ctx) {
     return XDP_PASS;
   }
 
-  /*
-  bpf_printk("IN: SRC IP %pI4 -> DST IP %pI4", &ip->saddr, &ip->daddr);
-  bpf_printk("IN: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             eth->h_source[0], eth->h_source[1], eth->h_source[2],
-             eth->h_source[3], eth->h_source[4], eth->h_source[5],
-             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
-             eth->h_dest[4], eth->h_dest[5]);
-  */
-
   // Store Load Balancer IP for later
   __u32 lb_ip = ip->daddr;
 
-  // Lookup conntrack (connection tracking) information - actually eBPF map
-  // Connection exist: backend response
-  // No Connection: client request
+  // Lookup NAT translation connection tracking information:
+  // - No Connection:    client request
+  // - Connection exist: backend response
   struct five_tuple_t in = {};
   in.src_ip = ip->daddr;     // LB IP
   in.dst_ip = ip->saddr;     // Client or Backend IP
@@ -335,7 +331,7 @@ int xdp_load_balancer(struct xdp_md *ctx) {
   if (!out) {
     //bpf_printk("Packet from client..");
 
-    // Check for existing connections
+    // Check for an existing connection
     struct five_tuple_t five_tuple = {};
     five_tuple.src_ip = ip->saddr;
     five_tuple.dst_ip = ip->daddr;
@@ -344,29 +340,22 @@ int xdp_load_balancer(struct xdp_md *ctx) {
     five_tuple.protocol = IPPROTO_TCP;
 
     struct backend *backend;
+    struct connection *conn_ptr;
     struct connection *conn = bpf_map_lookup_elem(&statetrack, &five_tuple);
     if (conn) {
-      //bpf_printk("Existing connection found in statetrack map - update state and proceed with the same backend..");
-      update_tcp_conn_state(five_tuple, conn, tcp, 0);
-      backend = bpf_map_lookup_elem(&backends, &conn->backend_index);
-      if (!backend) {
-        return XDP_ABORTED;
-      }
+      // Existing connection found in statetrack map - update state and proceed with the same backend..
+      conn_ptr = conn;
+      backend = bpf_map_lookup_elem(&backends, &conn_ptr->backend_index);
+      if (!backend) return XDP_ABORTED;
     } else {
-      // sanity check since a new connection must start with a SYN packet
-      if (tcp->syn == 0) {
-        return XDP_ABORTED;
-      }
-      //bpf_printk("No existing connection found in statetrack map, new connection so select a backend..");
-
-      // Select a backend using weighted least connections algorithm
+      // This is a new connection, we need to select a backend using weighted least connections algorithm
       __u32 key = 0;
-      __u32 min_score = (__u32) - 1; // Start with max value
+      __u32 min_score = (__u32) - 1; // Max value for unsigned int
+      struct backend *candidate_backend = NULL;
       for (__u32 i = 0; i < NUM_BACKENDS; i++) {
         __u32 idx = i;
-        struct backend *candidate_backend = bpf_map_lookup_elem(&backends, &idx);
-        
-        if (candidate_backend && candidate_backend->weight > 0) {
+        struct backend *b = bpf_map_lookup_elem(&backends, &idx);
+        if (b && b->weight > 0) {
           // Calculate score: (connections * scale) / weight
           // Higher weight reduces the score, making the backend more likely to be picked.
           // We add 1 to num_connections so that weight matters even at 0 connections.
@@ -375,24 +364,18 @@ int xdp_load_balancer(struct xdp_md *ctx) {
           if (score < min_score) {
             min_score = score;
             key = idx;
+            candidate_backend = b;
           }
         }
       }
+      if (!candidate_backend) return XDP_ABORTED;
+      backend = candidate_backend;
 
-      backend = bpf_map_lookup_elem(&backends, &key);
-      if (!backend) {
-        return XDP_ABORTED;
-      }
-      bpf_printk("Selected backend with IP %pI4 with current number of connections equal to %d", &backend->endpoint.ip, backend->num_connections);
-
-      // Store the selected backend for this connection in the statetrack map
+      // Initialize the connection state on the TCP SYN packet from the client
       struct connection new_conn = {};
       new_conn.backend_index = key;
-      new_conn.state = TCP_STATE_SYN_SEEN;
-      int ret = bpf_map_update_elem(&statetrack, &five_tuple, &new_conn, BPF_ANY);
-      if (ret != 0) {
-        return XDP_ABORTED;
-      }
+      new_conn.state = TCP_STATE_UNKNOWN;
+      conn_ptr = &new_conn;
 
       // Store connection in the conntrack eBPF map (client -> backend)
       struct five_tuple_t in_loadbalancer = {};
@@ -403,19 +386,13 @@ int xdp_load_balancer(struct xdp_md *ctx) {
       in_loadbalancer.protocol = IPPROTO_TCP;        // TCP protocol
       struct endpoint client;
       client.ip = ip->saddr; // Client IP
-      ret = bpf_map_update_elem(&conntrack, &in_loadbalancer, &client, BPF_ANY);
-      if (ret != 0) {
-        return XDP_ABORTED;
-      }
-
-      // Increment the connection count for the selected backend
-      struct backend updated_backend = *backend;
-      updated_backend.num_connections += 1;
-      ret = bpf_map_update_elem(&backends, &key, &updated_backend, BPF_ANY);
-      if (ret != 0) {
+      if (bpf_map_update_elem(&conntrack, &in_loadbalancer, &client, BPF_ANY) != 0) {
         return XDP_ABORTED;
       }
     }
+
+    // Update state for both existing and new connections
+    update_tcp_conn_state(five_tuple, conn_ptr, tcp, 0);
 
     // Perform a FIB lookup
     int rc = fib_lookup_v4_full(ctx, &fib, ip->daddr, backend->endpoint.ip,
@@ -431,19 +408,15 @@ int xdp_load_balancer(struct xdp_md *ctx) {
   } else {
     //bpf_printk("Packet from backend..");
 
-    // make the key to lookup the connection in the statetrack map
+    // Lookup and update the connection in the statetrack map
     struct five_tuple_t out_loadbalancer = {};
     out_loadbalancer.src_ip = out->ip;       // Client IP
     out_loadbalancer.dst_ip = ip->daddr;     // LB IP
     out_loadbalancer.src_port = tcp->dest;   // Client source port
     out_loadbalancer.dst_port = tcp->source; // Client destination port
     out_loadbalancer.protocol = IPPROTO_TCP; // TCP protocol
-
-    // Update connection state in statetrack map
     struct connection *conn = bpf_map_lookup_elem(&statetrack, &out_loadbalancer);
-    if (!conn) {
-      return XDP_ABORTED;
-    }
+    if (!conn) return XDP_ABORTED;
     update_tcp_conn_state(out_loadbalancer, conn, tcp, 1);
 
     // Perform a FIB lookup - same as above
@@ -474,16 +447,6 @@ int xdp_load_balancer(struct xdp_md *ctx) {
   // Ethernet MACs because the Ethernet frame checksum (FCS) isn’t in the header
   // but instead is automatically recomputed by the NIC hardware when the packet
   // is transmitted.
-
-  /*
-  bpf_printk("OUT: SRC IP %pI4 -> DST IP %pI4", &ip->saddr, &ip->daddr);
-  bpf_printk("OUT: SRC MAC %02x:%02x:%02x:%02x:%02x:%02x -> DST MAC "
-             "%02x:%02x:%02x:%02x:%02x:%02x",
-             eth->h_source[0], eth->h_source[1], eth->h_source[2],
-             eth->h_source[3], eth->h_source[4], eth->h_source[5],
-             eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], eth->h_dest[3],
-             eth->h_dest[4], eth->h_dest[5]);
-  */
 
   // Return XDP_TX to transmit the modified packet back to the network
   return XDP_TX;
